@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import scipy, numpy, fastapi, sqlalchemy, uvicorn; print\\('scipy', scipy.__version__, '| fastapi ok | sqlalchemy ok'\\)\")",
+      "Read(//opt/homebrew/bin/**)",
+      "Bash(xcode-select -p)",
+      "Bash(/opt/homebrew/bin/python3.13 -m venv backend/.venv)",
+      "Bash(backend/.venv/bin/pip install *)",
+      "Bash(backend/.venv/bin/python -c \"import scipy.optimize, numpy, fastapi; from scipy.optimize import milp; print\\('env OK, scipy', scipy.__version__\\)\")"
+    ]
+  }
+}
