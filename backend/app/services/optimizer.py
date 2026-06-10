@@ -18,6 +18,22 @@ lambda = 0 — satisfying the "deterministic first, then stochastic" rollout.
 Note on battery mutual exclusivity: simultaneous charge+discharge is not
 excluded with binaries; with positive degradation cost on both directions and
 non-negative prices it is never optimal, which holds in this market model.
+
+Market elasticity (price-maker model): the genco is large relative to the
+market, so its offers move the clearing price. A linear residual-demand curve
+is assumed per market:
+
+    price_eff(t) = price_fc(t) * (1 - impact * q(t))
+
+where q is the genco's cleared net volume and `impact` is the fractional
+price move per MW. Under uniform-price settlement revenue is the quadratic
+R(q) = p*(q - impact*q^2), which is concave, so it is linearized exactly
+enough with K offer blocks priced at marginal revenue R'(block midpoint) =
+p*(1 - 2*impact*mid) — no extra binaries needed: the LP fills the
+highest-priced blocks first. Buy-backs symmetrically push the price up
+(convex cost). The same treatment applies to reserve and regulation offers
+(small markets, hence larger relative impact), and CFD hedges settle on the
+moved price, which correctly damps the incentive to withhold volume.
 """
 import math
 from dataclasses import dataclass, field
@@ -35,6 +51,33 @@ CVAR_ALPHA = 0.90
 BUY_PREMIUM = 1.10        # buying energy back priced at USEP * premium (imbalance-style cost)
 SELL_CAP_MW = 800.0
 BUY_CAP_MW = 400.0
+
+# market elasticity defaults: % price move per 100 MW of cleared genco volume
+DEFAULT_MARKET = {
+    "enabled": True,
+    "n_blocks": 5,
+    "energy_impact_pct_per_100mw": 3.0,
+    "reserve_impact_pct_per_100mw": 15.0,
+    "regulation_impact_pct_per_100mw": 25.0,
+}
+
+
+def market_params(inp: "PortfolioInputs") -> dict:
+    """Resolve elasticity settings: defaults <- inp.market <- shock factor.
+
+    `market_impact_factor` shock scales all impacts (0 => price-taker)."""
+    mkt = dict(DEFAULT_MARKET)
+    mkt.update(inp.market or {})
+    factor = float(inp.shocks.get("market_impact_factor", 1.0))
+    if not mkt.get("enabled", True):
+        factor = 0.0
+    for k in list(mkt):
+        if k.endswith("_pct_per_100mw"):
+            mkt[k] = float(mkt[k]) * factor
+    mkt["enabled"] = factor > 0
+    if not mkt["enabled"]:
+        mkt["n_blocks"] = 1
+    return mkt
 
 
 @dataclass
@@ -68,6 +111,7 @@ class PortfolioInputs:
     under_penalty: float = 180.0  # $/MWh penalty on shortfall (on top of lost revenue)
     hedges: list = field(default_factory=list)  # [{direction, volume_mw, price, start, end}]
     shocks: dict = field(default_factory=dict)
+    market: dict = field(default_factory=dict)  # elasticity overrides, see DEFAULT_MARKET
 
 
 def build_scenarios(inp: PortfolioInputs, stochastic: bool = True) -> list[Scenario]:
@@ -160,13 +204,28 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
     S = len(scens)
     p1, p2, bt = inp.p1, inp.p2, inp.batt
 
+    mkt = market_params(inp)
+    K = int(mkt["n_blocks"])
+    imp_e = mkt["energy_impact_pct_per_100mw"] / 10000.0      # fraction per MW
+    imp_r = mkt["reserve_impact_pct_per_100mw"] / 10000.0
+    imp_g = mkt["regulation_impact_pct_per_100mw"] / 10000.0
+    w_sell, w_buy = SELL_CAP_MW / K, BUY_CAP_MW / K
+    rcap_tot = (p1.get("reserve_cap_mw", p1["ramp_mw_per_interval"])
+                + p2.get("reserve_cap_mw", p2["ramp_mw_per_interval"])
+                + bt["max_discharge_mw"])
+    gcap_tot = (p1.get("regulation_cap_mw", 0.0) + p2.get("regulation_cap_mw", 0.0)
+                + bt["max_discharge_mw"])
+    w_r, w_g = rcap_tot / K, gcap_tot / K
+
     idx = _Idx()
-    # first stage
-    for nm in ["u1", "u2", "su1", "su2", "sd1", "sd2",
-               "r1", "r2", "rb", "g1", "g2", "gb"]:
+    # first stage (reserve/regulation price-impact blocks tied to offer totals)
+    for nm in (["u1", "u2", "su1", "su2", "sd1", "sd2",
+                "r1", "r2", "rb", "g1", "g2", "gb"]
+               + [f"rblk{k}" for k in range(K)] + [f"gblk{k}" for k in range(K)]):
         idx.add_block(nm)
-    # second stage per scenario
-    ss_names = ["p1", "p2", "si", "sl", "ch", "dis", "soc", "sell", "buy", "short"]
+    # second stage per scenario (energy sales/purchases in price-impact blocks)
+    ss_names = (["p1", "p2", "si", "sl", "ch", "dis", "soc", "short"]
+                + [f"sell{k}" for k in range(K)] + [f"buy{k}" for k in range(K)])
     for s in range(S):
         for nm in ss_names:
             idx.add_block(f"{nm}_{s}")
@@ -190,6 +249,9 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
     ub[idx("g2"):idx("g2") + T] = p2.get("regulation_cap_mw", 0.0)
     ub[idx("rb"):idx("rb") + T] = bt["max_discharge_mw"]
     ub[idx("gb"):idx("gb") + T] = bt["max_discharge_mw"]
+    for k in range(K):
+        ub[idx(f"rblk{k}"):idx(f"rblk{k}") + T] = w_r
+        ub[idx(f"gblk{k}"):idx(f"gblk{k}") + T] = w_g
 
     soc_min = bt.get("soc_min_mwh", 0.05 * bt["capacity_mwh"])
     buffer_scale = {"conservative": 1.0, "balanced": 0.6, "aggressive": 0.2}.get(mode, 0.6)
@@ -210,10 +272,18 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
                 lo = max(lo, bt.get("soc_end_target_mwh", soc_min))
             lb[idx(f"soc_{s}", t)] = min(lo, bt["capacity_mwh"])
             ub[idx(f"soc_{s}", t)] = bt["capacity_mwh"]
-            ub[idx(f"sell_{s}", t)] = SELL_CAP_MW
-            ub[idx(f"buy_{s}", t)] = BUY_CAP_MW
+            for k in range(K):
+                ub[idx(f"sell{k}_{s}", t)] = w_sell
+                ub[idx(f"buy{k}_{s}", t)] = w_buy
             ub[idx(f"short_{s}", t)] = max(sc.demand[t], 0.0)
     lb[i_eta] = -1e8
+
+    # net hedged MW per interval — CFDs settle on the (impacted) spot price
+    hedge_mw = np.zeros(T)
+    for h in inp.hedges:
+        sgn = 1.0 if h.get("direction", "sell") == "sell" else -1.0
+        for t in range(int(h.get("start_interval", 0)), int(h.get("end_interval", T - 1)) + 1):
+            hedge_mw[t] += sgn * h["volume_mw"]
 
     # ---- per-scenario profit coefficient vectors (and constants)
     sc_coef = [dict() for _ in range(S)]
@@ -224,21 +294,28 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
         mc1 = p1["marginal_cost"] * sc.fuel_factor
         mc2 = p2["marginal_cost"] * sc.fuel_factor
         for t in range(T):
-            cf[idx(f"sell_{s}", t)] = sc.usep[t] * DT
-            cf[idx(f"buy_{s}", t)] = -sc.usep[t] * BUY_PREMIUM * DT
+            # energy blocks at marginal revenue / marginal cost of the moved
+            # price; hadj: selling depresses the price hedged CFDs settle on
+            hadj = imp_e * sc.usep[t] * hedge_mw[t] * DT
+            for k in range(K):
+                mid_s, mid_b = (k + 0.5) * w_sell, (k + 0.5) * w_buy
+                cf[idx(f"sell{k}_{s}", t)] = \
+                    sc.usep[t] * max(0.0, 1 - 2 * imp_e * mid_s) * DT + hadj
+                cf[idx(f"buy{k}_{s}", t)] = \
+                    -sc.usep[t] * BUY_PREMIUM * (1 + 2 * imp_e * mid_b) * DT - hadj
             cf[idx(f"short_{s}", t)] = -(inp.contract_price + inp.under_penalty) * DT
             cf[idx(f"p1_{s}", t)] = -mc1 * DT
             cf[idx(f"p2_{s}", t)] = -mc2 * DT
             cf[idx(f"si_{s}", t)] = -inp.import_cost * DT
             cf[idx(f"ch_{s}", t)] = -deg * 0.5 * DT
             cf[idx(f"dis_{s}", t)] = -deg * 0.5 * DT
-            # first-stage vars valued at this scenario's prices
-            cf[idx("r1", t)] = cf.get(idx("r1", t), 0) + sc.rprice[t] * DT
-            cf[idx("r2", t)] = cf.get(idx("r2", t), 0) + sc.rprice[t] * DT
-            cf[idx("rb", t)] = cf.get(idx("rb", t), 0) + sc.rprice[t] * DT
-            cf[idx("g1", t)] = cf.get(idx("g1", t), 0) + sc.gprice[t] * DT
-            cf[idx("g2", t)] = cf.get(idx("g2", t), 0) + sc.gprice[t] * DT
-            cf[idx("gb", t)] = cf.get(idx("gb", t), 0) + sc.gprice[t] * DT
+            # first-stage vars valued at this scenario's prices; reserve and
+            # regulation revenue accrues on the price-impact blocks
+            for k in range(K):
+                cf[idx(f"rblk{k}", t)] = \
+                    sc.rprice[t] * max(0.0, 1 - 2 * imp_r * (k + 0.5) * w_r) * DT
+                cf[idx(f"gblk{k}", t)] = \
+                    sc.gprice[t] * max(0.0, 1 - 2 * imp_g * (k + 0.5) * w_g) * DT
             cf[idx("su1", t)] = -p1.get("startup_cost", 0.0)
             cf[idx("su2", t)] = -p2.get("startup_cost", 0.0)
             cf[idx("sd1", t)] = -p1.get("shutdown_cost", 0.0)
@@ -276,16 +353,27 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
                 add({idx(su, t): 1, idx(u, t): -1, idx(u, t - 1): 1}, 0, np.inf)
                 add({idx(sd, t): 1, idx(u, t): 1, idx(u, t - 1): -1}, 0, np.inf)
 
+    for t in range(T):  # reserve/regulation offer totals fill the price-impact blocks
+        coefs = {idx(f"rblk{k}", t): 1.0 for k in range(K)}
+        coefs.update({idx("r1", t): -1.0, idx("r2", t): -1.0, idx("rb", t): -1.0})
+        add(coefs, 0, 0)
+        coefs = {idx(f"gblk{k}", t): 1.0 for k in range(K)}
+        coefs.update({idx("g1", t): -1.0, idx("g2", t): -1.0, idx("gb", t): -1.0})
+        add(coefs, 0, 0)
+
     eff_c = math.sqrt(bt.get("round_trip_eff", 0.88))
     eff_d = math.sqrt(bt.get("round_trip_eff", 0.88))
 
     for s, sc in enumerate(scens):
         for t in range(T):
             # energy balance
-            add({idx(f"si_{s}", t): 1, idx(f"sl_{s}", t): 1, idx(f"p1_{s}", t): 1,
-                 idx(f"p2_{s}", t): 1, idx(f"dis_{s}", t): 1, idx(f"ch_{s}", t): -1,
-                 idx(f"buy_{s}", t): 1, idx(f"sell_{s}", t): -1, idx(f"short_{s}", t): 1},
-                float(sc.demand[t]), float(sc.demand[t]))
+            bal = {idx(f"si_{s}", t): 1, idx(f"sl_{s}", t): 1, idx(f"p1_{s}", t): 1,
+                   idx(f"p2_{s}", t): 1, idx(f"dis_{s}", t): 1, idx(f"ch_{s}", t): -1,
+                   idx(f"short_{s}", t): 1}
+            for k in range(K):
+                bal[idx(f"buy{k}_{s}", t)] = 1
+                bal[idx(f"sell{k}_{s}", t)] = -1
+            add(bal, float(sc.demand[t]), float(sc.demand[t]))
             # plant capacity with reserve+regulation headroom; floor with regulation-down room
             for pp, u, rr, gg, prm in [("p1", "u1", "r1", "g1", p1), ("p2", "u2", "r2", "g2", p2)]:
                 pmax = prm["p_max"] * (sc.p1max_factor if pp == "p1" else sc.p2max_factor)
@@ -360,11 +448,12 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
     objective = (1 - lam) * expected_profit + lam * cvar
 
     return _extract(inp, scens, x, idx, mode, method, lam,
-                    expected_profit, cvar, objective, profits, probs)
+                    expected_profit, cvar, objective, profits, probs,
+                    {"K": K, "imp_e": imp_e, "mkt": mkt})
 
 
 def _extract(inp, scens, x, idx, mode, method, lam,
-             expected_profit, cvar, objective, profits, probs):
+             expected_profit, cvar, objective, profits, probs, elast):
     """Pull the base-scenario schedule, market allocation, risk stats and
     binding-constraint diagnostics out of the solution vector."""
     p1, p2, bt = inp.p1, inp.p2, inp.batt
@@ -372,6 +461,8 @@ def _extract(inp, scens, x, idx, mode, method, lam,
     sc0 = scens[base]
     g = lambda nm, t: float(x[idx(nm, t)])
     S = len(scens)
+    K, imp_e = elast["K"], elast["imp_e"]
+    blk = lambda nm, s, t: sum(float(x[idx(f"{nm}{k}_{s}", t)]) for k in range(K))
 
     fc = inp.fc
     sig_combined = np.sqrt(np.array(fc["solar_import"]["sigma"], dtype=float) ** 2
@@ -384,7 +475,9 @@ def _extract(inp, scens, x, idx, mode, method, lam,
         si, sl = g(f"si_{base}", t), g(f"sl_{base}", t)
         pp1, pp2 = g(f"p1_{base}", t), g(f"p2_{base}", t)
         ch, dis, soc = g(f"ch_{base}", t), g(f"dis_{base}", t), g(f"soc_{base}", t)
-        sell, buy, short = g(f"sell_{base}", t), g(f"buy_{base}", t), g(f"short_{base}", t)
+        sell, buy = blk("sell", base, t), blk("buy", base, t)
+        short = g(f"short_{base}", t)
+        price_impact = float(sc0.usep[t]) * imp_e * (sell - buy)
         r_tot = g("r1", t) + g("r2", t) + g("rb", t)
         g_tot = g("g1", t) + g("g2", t) + g("gb", t)
         avail_solar = min(max(sc0.solar_import[t], 0), inp.import_limit_mw * sc0.import_limit_factor) \
@@ -436,6 +529,8 @@ def _extract(inp, scens, x, idx, mode, method, lam,
                                  "battery": rnd(g("gb", t))},
             "risk_buffer_mw": rnd(headroom),
             "usep": rnd(float(sc0.usep[t])),
+            "usep_effective": rnd(float(sc0.usep[t]) - price_impact),
+            "price_impact": rnd(price_impact),
             "demand_mw": rnd(dem),
             "shortfall_prob": round(p_short, 4),
             "imbalance_prob": round(p_imbal, 4),
@@ -452,6 +547,23 @@ def _extract(inp, scens, x, idx, mode, method, lam,
                           for s in range(S)))
     var95 = float(np.percentile(np.repeat(profits, (probs * 1000).astype(int) + 1), 5))
 
+    mkt = elast["mkt"]
+    sell_mwh = sum(iv["energy_sell_mw"] for iv in intervals) * DT
+    buy_mwh = sum(iv["energy_buy_mw"] for iv in intervals) * DT
+    sell_rev = sum(iv["usep_effective"] * iv["energy_sell_mw"] for iv in intervals) * DT
+    market_impact = {
+        "enabled": mkt["enabled"],
+        "energy_impact_pct_per_100mw": rnd(mkt["energy_impact_pct_per_100mw"]),
+        "reserve_impact_pct_per_100mw": rnd(mkt["reserve_impact_pct_per_100mw"]),
+        "regulation_impact_pct_per_100mw": rnd(mkt["regulation_impact_pct_per_100mw"]),
+        "n_blocks": elast["K"],
+        "energy_sold_mwh": rnd(sell_mwh), "energy_bought_mwh": rnd(buy_mwh),
+        "avg_usep_forecast": rnd(float(np.mean(sc0.usep))),
+        "avg_sell_price_received": rnd(sell_rev / sell_mwh) if sell_mwh > 1e-6 else None,
+        "max_price_impact": rnd(max((iv["price_impact"] for iv in intervals), key=abs)
+                                if intervals else 0.0),
+    }
+
     return {
         "status": "solved", "mode": mode, "method": method, "risk_lambda": lam,
         "objective_value": rnd(objective), "expected_profit": rnd(expected_profit),
@@ -460,6 +572,7 @@ def _extract(inp, scens, x, idx, mode, method, lam,
         "expected_shortfall_mwh": rnd(exp_short),
         "shortfall_prob_day": round(float(sum(probs[s] for s in range(S)
             if any(x[idx(f"short_{s}", t)] > 0.05 for t in range(T)))), 4),
+        "market_impact": market_impact,
         "intervals": intervals,
     }
 
