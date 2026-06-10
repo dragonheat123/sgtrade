@@ -448,6 +448,8 @@ SCENARIO_PRESETS = [
     {"name": "Regulation price ×3", "shocks": {"regulation_price_factor": 3.0}},
     {"name": "Import constraint 50%", "shocks": {"import_limit_factor": 0.5}},
     {"name": "Fuel cost +30%", "shocks": {"fuel_factor": 1.3}},
+    {"name": "Thin market (2× price impact)", "shocks": {"market_impact_factor": 2.0}},
+    {"name": "Price-taker (no market impact)", "shocks": {"market_impact_factor": 0.0}},
 ]
 
 
