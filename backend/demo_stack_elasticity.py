@@ -48,18 +48,30 @@ def main():
 
     print("\n--- Re-cleared stack: today's elasticity curve " + "-" * 31)
     print(f"{'period':>8s}{'clearing $':>12s}{'cushion MW':>12s}"
-          f"{'impact %/100MW':>16s}{'sigma':>8s}")
-    for t in [6, 16, 22, 27, 34, 36, 38, 40, 42, 46]:
+          f"{'static b':>10s}{'ramp-aware b':>14s}{'sigma':>8s}{'ramp prem $':>12s}")
+    for t in [6, 16, 22, 27, 33, 34, 35, 36, 37, 38, 40, 42, 46]:
         h, m = divmod(t * 30, 60)
         print(f"{h:02d}:{m:02d}   {fc['clearing_price_p50'][t]:>12,.0f}"
               f"{fc['supply_cushion_p50'][t]:>12,.0f}"
-              f"{fc['impact_pct_per_100mw'][t]:>16.2f}"
-              f"{fc['impact_sigma'][t]:>8.2f}")
+              f"{fc['impact_static_pct_per_100mw'][t]:>10.2f}"
+              f"{fc['impact_pct_per_100mw'][t]:>14.2f}"
+              f"{fc['impact_sigma'][t]:>8.2f}"
+              f"{fc['ramp_premium_p50'][t]:>12.1f}")
     curve = fc["impact_pct_per_100mw"]
     print(f"\n  -> midday is flat (solar glut, fat CCGT bands), the evening peak is "
           f"steep\n     (clearing on OCGT/peaker bands with a thin cushion). "
           f"Flat default was 3.0;\n     forecast ranges "
           f"{min(curve):.1f} .. {max(curve):.1f} %/100MW.")
+    print(f"\n  -> ramp coupling: beta_t is conditioned on the previous interval's "
+          f"dispatch\n     state. On the evening pickup the cheap CCGTs are "
+          f"ramp-pinned, so only the\n     fast (expensive) units can respond: "
+          f"ramp-aware beta runs 2-3x the static\n     merit-order value, "
+          f"correlates {fc['ramp_excess_vs_residual_ramp_corr']:.2f} with how hard "
+          f"the market must ramp away from\n     its previous dispatch point, and "
+          f"stays elevated after the ramp slows while\n     pinned units catch up. "
+          f"Negative ramp premiums after the peak are the same\n     effect "
+          f"downward: inflexible units hold output through the drop and\n     "
+          f"suppress the price.")
 
     print("\n--- Optimizer: flat 3% assumption vs stack forecast " + "-" * 25)
     t0 = time.time()

@@ -16,16 +16,24 @@ Reconstruction is posed as a factor graph:
                                   delayed stack's CCGT first offer bands
   CF_t solar capacity factor      weather forecast (cloud) evidence
   D_t  system demand              demand forecast + temperature evidence
-  b_t  price impact (elasticity)  deterministic re-clearing of the sampled
-                                  stack at D_t and D_t - 100 MW
+  O_ut dispatch state of unit u   deterministic ramp-constrained merit-order
+                                  transition from O_u,t-1
+  b_t  price impact (elasticity)  re-clearing of the *ramp-feasible* stack
+                                  at D_t and D_t - 100 MW
 
-The graph is a tree (every latent has independent evidence; they only meet
-at the clearing node), so exact inference is a single pass of conjugate
-Beta/Gaussian updates — no loopy belief propagation needed. The clearing
-factor is the one non-linearity, so the marginal of b_t is obtained by Monte
-Carlo over the closed-form posteriors of its parents. The resulting per-
-interval p50/sigma feed the optimizer's market-elasticity model
-(`market["energy_impact_pct_per_100mw"]` accepts a length-48 curve).
+The latents form a polytree: availability/fuel/weather have independent
+evidence, so exact inference is a single pass of conjugate Beta/Gaussian
+updates — no loopy belief propagation needed. The dispatch state O_t chains
+the intervals together: only capacity reachable within one interval from the
+previous dispatch point (|out_t - out_t-1| <= ramp_u) can respond to a
+perturbation, so b_t is conditioned on b_t-1 — when competitor units are
+ramp-pinned on the evening pickup, the short-run curve is much steeper than
+the static merit order, and the steepness persists for several intervals.
+Because the O_t transition is deterministic given its parents, it is handled
+exactly by forward simulation inside the Monte Carlo that marginalizes the
+clearing factor. The resulting per-interval p50/sigma feed the optimizer's
+market-elasticity model (`market["energy_impact_pct_per_100mw"]` accepts a
+length-48 curve).
 """
 import datetime as dt
 
@@ -44,30 +52,34 @@ FUEL_OBS_SIGMA = 0.03
 # Competitor fleet (the rest of the market; our own genco's units are
 # excluded — elasticity is the slope of the residual curve we face).
 # bands: fraction of available capacity offered at mc * multiplier.
+# ramp: MW per 30-min interval — couples the elasticity across intervals.
 _CCGT_BANDS = [(0.55, 1.00), (0.30, 1.18), (0.15, 1.50)]
 FLEET = [
-    {"name": f"CCGT-{n}", "tech": "ccgt", "cap": cap, "mc": mc, "bands": _CCGT_BANDS}
+    {"name": f"CCGT-{n}", "tech": "ccgt", "cap": cap, "mc": mc, "bands": _CCGT_BANDS,
+     "ramp": round(0.25 * cap)}
     for n, (cap, mc) in enumerate([
         (430, 86), (420, 89), (410, 92), (400, 94), (390, 96), (380, 98),
         (370, 100), (360, 103), (350, 106), (340, 108), (335, 110), (330, 112)], 1)
 ] + [
-    {"name": "ST-E1", "tech": "st", "cap": 250, "mc": 152, "bands": [(0.65, 1.0), (0.35, 1.22)]},
-    {"name": "ST-E2", "tech": "st", "cap": 220, "mc": 158, "bands": [(0.65, 1.0), (0.35, 1.22)]},
-    {"name": "ST-E3", "tech": "st", "cap": 240, "mc": 163, "bands": [(0.65, 1.0), (0.35, 1.22)]},
-    {"name": "OCGT-F1", "tech": "ocgt", "cap": 170, "mc": 168, "bands": [(0.6, 1.0), (0.4, 1.3)]},
-    {"name": "OCGT-F2", "tech": "ocgt", "cap": 150, "mc": 174, "bands": [(0.6, 1.0), (0.4, 1.3)]},
-    {"name": "OCGT-F3", "tech": "ocgt", "cap": 180, "mc": 179, "bands": [(0.6, 1.0), (0.4, 1.3)]},
-    {"name": "PEAK-G1", "tech": "peaker", "cap": 300, "mc": 300, "bands": [(0.5, 1.0), (0.5, 1.7)]},
-    {"name": "PEAK-G2", "tech": "peaker", "cap": 260, "mc": 420, "bands": [(0.5, 1.0), (0.5, 1.6)]},
-    {"name": "IMPORT-MY", "tech": "import", "cap": 600, "mc": 66, "bands": [(1.0, 1.0)]},
-    {"name": "COGEN-WTE", "tech": "mustrun", "cap": 800, "mc": 0, "bands": [(1.0, 1.0)]},
-    {"name": "SOLAR-AGG", "tech": "solar", "cap": 1100, "mc": 0, "bands": [(1.0, 1.0)]},
+    {"name": "ST-E1", "tech": "st", "cap": 250, "mc": 152, "bands": [(0.65, 1.0), (0.35, 1.22)], "ramp": 38},
+    {"name": "ST-E2", "tech": "st", "cap": 220, "mc": 158, "bands": [(0.65, 1.0), (0.35, 1.22)], "ramp": 33},
+    {"name": "ST-E3", "tech": "st", "cap": 240, "mc": 163, "bands": [(0.65, 1.0), (0.35, 1.22)], "ramp": 36},
+    {"name": "OCGT-F1", "tech": "ocgt", "cap": 170, "mc": 168, "bands": [(0.6, 1.0), (0.4, 1.3)], "ramp": 170},
+    {"name": "OCGT-F2", "tech": "ocgt", "cap": 150, "mc": 174, "bands": [(0.6, 1.0), (0.4, 1.3)], "ramp": 150},
+    {"name": "OCGT-F3", "tech": "ocgt", "cap": 180, "mc": 179, "bands": [(0.6, 1.0), (0.4, 1.3)], "ramp": 180},
+    {"name": "PEAK-G1", "tech": "peaker", "cap": 300, "mc": 300, "bands": [(0.5, 1.0), (0.5, 1.7)], "ramp": 300},
+    {"name": "PEAK-G2", "tech": "peaker", "cap": 260, "mc": 420, "bands": [(0.5, 1.0), (0.5, 1.6)], "ramp": 260},
+    {"name": "IMPORT-MY", "tech": "import", "cap": 600, "mc": 66, "bands": [(1.0, 1.0)], "ramp": 200},
+    {"name": "COGEN-WTE", "tech": "mustrun", "cap": 800, "mc": 0, "bands": [(1.0, 1.0)], "ramp": 0},
+    {"name": "SOLAR-AGG", "tech": "solar", "cap": 1100, "mc": 0, "bands": [(1.0, 1.0)], "ramp": 0},
 ]
 FUEL_TECHS = {"ccgt", "st", "ocgt", "peaker"}
 
 DEFAULT_WEATHER = {"cloud_factor_p50": 0.90, "cloud_factor_sigma": 0.12,
                    "temp_delta_p50": 0.0, "temp_delta_sigma": 1.2}
 DEMAND_TEMP_SENS = 0.018      # fractional demand change per degC (aircon load)
+DEMAND_NOISE_MW = 80.0        # intraday demand forecast error (marginal sigma)
+DEMAND_NOISE_AR1 = 0.8        # errors persist intraday (matches forecasting.py)
 
 
 # ------------------------------------------------- synthetic publications ----
@@ -140,19 +152,24 @@ def fuse(stacks: list[dict], outage_notices: dict | None = None,
 
 
 # -------------------------------------------------------- stack re-clearing ----
-def _clear(cum_mw: np.ndarray, prices: np.ndarray, residual: float) -> float:
-    if residual <= 0:
+def _price_at(cum_mw: np.ndarray, prices: np.ndarray, q: float) -> float:
+    if q <= 0:
         return 0.0
-    i = int(np.searchsorted(cum_mw, residual))
+    i = int(np.searchsorted(cum_mw, q))
     return float(prices[i]) if i < len(prices) else PRICE_CAP
 
 
 def forecast(beliefs: dict, weather: dict | None = None,
              demand_p50: np.ndarray | None = None,
              n_samples: int = 400, seed: int = 11) -> dict:
-    """Marginalize the clearing factor by Monte Carlo over the posteriors:
-    sample fuel/availability/weather/demand, rebuild the stack, and take the
-    price move from clearing 100 MW less residual demand at every interval."""
+    """Marginalize the clearing factor by Monte Carlo over the posteriors.
+
+    Each sample simulates the day sequentially: units carry a dispatch state
+    forward, and at every interval only the band capacity reachable within
+    one ramp (|out_t - out_t-1| <= ramp_u) can respond. The elasticity is the
+    price move from clearing 100 MW less residual demand on that ramp-
+    feasible stack, so b_t is conditioned on the previous interval's dispatch
+    (and hence on b_t-1). A static (ramp-free) clear is kept as a diagnostic."""
     rng = np.random.default_rng(seed)
     w = dict(DEFAULT_WEATHER, **(weather or {}))
     dem50 = (np.asarray(demand_p50, dtype=float) if demand_p50 is not None
@@ -161,9 +178,15 @@ def forecast(beliefs: dict, weather: dict | None = None,
     units = beliefs["units"]
     fuel = beliefs["fuel"]
 
+    priced = [u for u in FLEET if u["tech"] not in ("mustrun", "solar")]
+    nu = len(priced)
+
     beta = np.zeros((n_samples, T))
+    beta_st = np.zeros((n_samples, T))
     price = np.zeros((n_samples, T))
+    prem = np.zeros((n_samples, T))
     cushion = np.zeros((n_samples, T))
+    dres = np.zeros((n_samples, T))   # residual-demand ramp rate (MW/interval)
     for n in range(n_samples):
         f = rng.normal(fuel["mean"], fuel["sigma"])
         cf = float(np.clip(rng.normal(w["cloud_factor_p50"], w["cloud_factor_sigma"]), 0.05, 1.15))
@@ -171,33 +194,87 @@ def forecast(beliefs: dict, weather: dict | None = None,
             * rng.normal(1.0, 0.015)
         avail = {nm: (b["forced"] if b["forced"] is not None
                       else rng.beta(b["a"], b["b"])) for nm, b in units.items()}
-        bands, mustrun, solar_cap = [], 0.0, 0.0
-        for u in FLEET:
-            mw_avail = u["cap"] * avail[u["name"]]
-            if u["tech"] == "mustrun":
-                mustrun += mw_avail
-            elif u["tech"] == "solar":
-                solar_cap += mw_avail
-            else:
-                fm = f if u["tech"] in FUEL_TECHS else 1.0
-                bands += [(u["mc"] * mult * fm, mw_avail * frac) for frac, mult in u["bands"]]
-        bands.sort()
-        prices = np.array([p for p, _ in bands])
-        cum = np.cumsum([q for _, q in bands])
+        cap = np.array([u["cap"] * avail[u["name"]] for u in priced])
+        ramp = np.array([u["ramp"] * avail[u["name"]] for u in priced])
+        mustrun = sum(u["cap"] * avail[u["name"]] for u in FLEET if u["tech"] == "mustrun")
+        solar_cap = sum(u["cap"] * avail[u["name"]] for u in FLEET if u["tech"] == "solar")
+
+        # offer segments in price order (fixed per sample); each segment is a
+        # band slice [s0, s1] of its unit's available capacity
+        sp, su, f0, f1 = [], [], [], []
+        for i, u in enumerate(priced):
+            fm = f if u["tech"] in FUEL_TECHS else 1.0
+            c = 0.0
+            for frac, mult in u["bands"]:
+                sp.append(u["mc"] * mult * fm); su.append(i)
+                f0.append(c); c += frac; f1.append(c)
+        order = np.argsort(sp, kind="stable")
+        sp = np.asarray(sp)[order]
+        su = np.asarray(su)[order]
+        s0 = np.asarray(f0)[order] * cap[su]
+        s1 = np.asarray(f1)[order] * cap[su]
+        st_width = s1 - s0
+        st_cum = np.cumsum(st_width)
+
+        out = None  # per-unit dispatch state carried across intervals
+        err, res_prev = 0.0, None   # AR(1) intraday demand forecast error
         for t in range(T):
             solar = solar_cap * cf * solar_prof[t]
-            dem = dem50[t] * dem_lvl + rng.normal(0.0, 80.0)
+            err = (DEMAND_NOISE_AR1 * err
+                   + (1 - DEMAND_NOISE_AR1 ** 2) ** 0.5 * rng.normal(0.0, DEMAND_NOISE_MW))
+            dem = dem50[t] * dem_lvl + err
             residual = dem - mustrun - solar
-            p0 = _clear(cum, prices, residual)
-            pdn = _clear(cum, prices, residual - 100.0)
+            dres[n, t] = residual - (res_prev if res_prev is not None else residual)
+            res_prev = residual
+            if out is None:  # steady overnight start: static dispatch
+                fill = np.clip(residual - np.concatenate(([0.0], st_cum[:-1])), 0.0, st_width)
+                out = np.bincount(su, weights=fill, minlength=nu)
+            # ramp-feasible window around the previous dispatch point
+            lo = np.maximum(0.0, out - ramp)
+            hi = np.minimum(cap, out + ramp)
+            slo = np.clip(s0, lo[su], hi[su])
+            shi = np.clip(s1, lo[su], hi[su])
+            inc = shi - slo
+            cum = np.cumsum(inc)
+            need = residual - float(lo.sum())
+            p0 = _price_at(cum, sp, need)
+            pdn = _price_at(cum, sp, need - 100.0)
+            pst = _price_at(st_cum, sp, residual)
+            pst_dn = _price_at(st_cum, sp, residual - 100.0)
+            fill = np.clip(need - np.concatenate(([0.0], cum[:-1])), 0.0, inc)
+            out = lo + np.bincount(su, weights=fill, minlength=nu)
             beta[n, t] = np.clip(100.0 * (p0 - pdn) / max(p0, 1.0), 0.0, 40.0)
+            beta_st[n, t] = np.clip(100.0 * (pst - pst_dn) / max(pst, 1.0), 0.0, 40.0)
             price[n, t] = p0
-            cushion[n, t] = cum[-1] + mustrun + solar - dem
+            prem[n, t] = p0 - pst
+            cushion[n, t] = float(hi.sum()) + mustrun + solar - dem
 
-    r2 = lambda a: [round(float(v), 2) for v in a]
+    # lag-1 autocorrelation of the elasticity anomalies — the temporal
+    # coupling introduced by competitor ramp constraints (the static value
+    # isolates what shared daily drivers alone explain)
+    def lag1(m):
+        a = m - m.mean(axis=0)
+        return float((a[:, 1:] * a[:, :-1]).sum()
+                     / max(np.sqrt((a[:, 1:] ** 2).sum() * (a[:, :-1] ** 2).sum()), 1e-9))
+
+    # the ramp mechanism, measured directly: the excess of ramp-aware over
+    # static elasticity tracks how hard the rest of the market is being asked
+    # to ramp away from its previous-interval dispatch point (interval-level;
+    # the excess also outlasts the ramp while pinned units catch up, which is
+    # the persistence and caps this correlation)
+    excess = (beta - beta_st).mean(axis=0)[1:]
+    ramping = dres.mean(axis=0)[1:]
+    ramp_corr = float(np.corrcoef(excess, ramping)[0, 1])
+
+    r2 = lambda arr: [round(float(v), 2) for v in arr]
     return {
         "impact_pct_per_100mw": r2(beta.mean(axis=0)),
         "impact_sigma": r2(beta.std(axis=0)),
+        "impact_static_pct_per_100mw": r2(beta_st.mean(axis=0)),
+        "impact_lag1_autocorr": round(lag1(beta), 3),
+        "impact_lag1_autocorr_static": round(lag1(beta_st), 3),
+        "ramp_excess_vs_residual_ramp_corr": round(ramp_corr, 3),
+        "ramp_premium_p50": r2(prem.mean(axis=0)),
         "clearing_price_p50": r2(price.mean(axis=0)),
         "supply_cushion_p50": [round(float(v), 0) for v in cushion.mean(axis=0)],
         "fuel_index": {"mean": round(fuel["mean"], 4), "sigma": round(fuel["sigma"], 4)},
