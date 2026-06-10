@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from . import models, seed
 from .database import Base, engine, get_db
-from .services import bidbands, explain, forecasting, optimizer, risk
+from .services import bidbands, elasticity, explain, forecasting, optimizer, risk
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="SG GenCo Trading & Portfolio Optimization Platform")
@@ -113,7 +113,9 @@ def build_inputs(db: Session, date: dt.date, shocks: dict | None = None) -> opti
         import_cost=imp.get("ppa_cost_per_mwh", 62),
         contract_price=contract.contract_price if contract else 145.0,
         under_penalty=contract.under_delivery_penalty if contract else 180.0,
-        hedges=hedges, shocks=shocks or {})
+        hedges=hedges, shocks=shocks or {},
+        # per-interval price impact forecast from the delayed offer stack
+        market={"energy_impact_pct_per_100mw": elasticity.impact_curve(date)})
 
 
 # ------------------------------------------------------------ portfolio ----
@@ -206,6 +208,16 @@ def forecast_errors(kind: str | None = None, db: Session = Depends(get_db),
     errs = q.limit(2000).all()
     return [{"kind": e.kind, "interval": e.interval, "forecast": e.forecast,
              "actual": e.actual, "error": e.error} for e in errs]
+
+
+# ----------------------------------------------------------- elasticity ----
+@app.get("/api/elasticity/forecast")
+def elasticity_forecast(date: str | None = None, user=Depends(current_user)):
+    """Per-interval price-impact forecast reconstructed from the delayed
+    offer stack (factor-graph fusion of stack history, outage notices,
+    same-day unit telemetry and weather)."""
+    return {"trade_date": _date(date).isoformat(),
+            **elasticity.forecast_for_date(_date(date))}
 
 
 # --------------------------------------------------------------- assets ----

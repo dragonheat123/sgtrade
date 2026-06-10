@@ -65,7 +65,9 @@ DEFAULT_MARKET = {
 def market_params(inp: "PortfolioInputs") -> dict:
     """Resolve elasticity settings: defaults <- inp.market <- shock factor.
 
-    `market_impact_factor` shock scales all impacts (0 => price-taker)."""
+    Impact values may be scalars or length-T curves (e.g. forecast from the
+    delayed offer stack). `market_impact_factor` shock scales all impacts
+    (0 => price-taker)."""
     mkt = dict(DEFAULT_MARKET)
     mkt.update(inp.market or {})
     factor = float(inp.shocks.get("market_impact_factor", 1.0))
@@ -73,7 +75,8 @@ def market_params(inp: "PortfolioInputs") -> dict:
         factor = 0.0
     for k in list(mkt):
         if k.endswith("_pct_per_100mw"):
-            mkt[k] = float(mkt[k]) * factor
+            v = np.asarray(mkt[k], dtype=float) * factor
+            mkt[k] = float(v) if v.ndim == 0 else [float(x) for x in v]
     mkt["enabled"] = factor > 0
     if not mkt["enabled"]:
         mkt["n_blocks"] = 1
@@ -206,9 +209,11 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
 
     mkt = market_params(inp)
     K = int(mkt["n_blocks"])
-    imp_e = mkt["energy_impact_pct_per_100mw"] / 10000.0      # fraction per MW
-    imp_r = mkt["reserve_impact_pct_per_100mw"] / 10000.0
-    imp_g = mkt["regulation_impact_pct_per_100mw"] / 10000.0
+    # per-interval impact curves (fraction per MW); scalars broadcast to T
+    as_curve = lambda v: np.resize(np.asarray(v, dtype=float), T) / 10000.0
+    imp_e = as_curve(mkt["energy_impact_pct_per_100mw"])
+    imp_r = as_curve(mkt["reserve_impact_pct_per_100mw"])
+    imp_g = as_curve(mkt["regulation_impact_pct_per_100mw"])
     w_sell, w_buy = SELL_CAP_MW / K, BUY_CAP_MW / K
     rcap_tot = (p1.get("reserve_cap_mw", p1["ramp_mw_per_interval"])
                 + p2.get("reserve_cap_mw", p2["ramp_mw_per_interval"])
@@ -296,13 +301,13 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
         for t in range(T):
             # energy blocks at marginal revenue / marginal cost of the moved
             # price; hadj: selling depresses the price hedged CFDs settle on
-            hadj = imp_e * sc.usep[t] * hedge_mw[t] * DT
+            hadj = imp_e[t] * sc.usep[t] * hedge_mw[t] * DT
             for k in range(K):
                 mid_s, mid_b = (k + 0.5) * w_sell, (k + 0.5) * w_buy
                 cf[idx(f"sell{k}_{s}", t)] = \
-                    sc.usep[t] * max(0.0, 1 - 2 * imp_e * mid_s) * DT + hadj
+                    sc.usep[t] * max(0.0, 1 - 2 * imp_e[t] * mid_s) * DT + hadj
                 cf[idx(f"buy{k}_{s}", t)] = \
-                    -sc.usep[t] * BUY_PREMIUM * (1 + 2 * imp_e * mid_b) * DT - hadj
+                    -sc.usep[t] * BUY_PREMIUM * (1 + 2 * imp_e[t] * mid_b) * DT - hadj
             cf[idx(f"short_{s}", t)] = -(inp.contract_price + inp.under_penalty) * DT
             cf[idx(f"p1_{s}", t)] = -mc1 * DT
             cf[idx(f"p2_{s}", t)] = -mc2 * DT
@@ -313,9 +318,9 @@ def solve(inp: PortfolioInputs, mode: str = "balanced",
             # regulation revenue accrues on the price-impact blocks
             for k in range(K):
                 cf[idx(f"rblk{k}", t)] = \
-                    sc.rprice[t] * max(0.0, 1 - 2 * imp_r * (k + 0.5) * w_r) * DT
+                    sc.rprice[t] * max(0.0, 1 - 2 * imp_r[t] * (k + 0.5) * w_r) * DT
                 cf[idx(f"gblk{k}", t)] = \
-                    sc.gprice[t] * max(0.0, 1 - 2 * imp_g * (k + 0.5) * w_g) * DT
+                    sc.gprice[t] * max(0.0, 1 - 2 * imp_g[t] * (k + 0.5) * w_g) * DT
             cf[idx("su1", t)] = -p1.get("startup_cost", 0.0)
             cf[idx("su2", t)] = -p2.get("startup_cost", 0.0)
             cf[idx("sd1", t)] = -p1.get("shutdown_cost", 0.0)
@@ -477,7 +482,7 @@ def _extract(inp, scens, x, idx, mode, method, lam,
         ch, dis, soc = g(f"ch_{base}", t), g(f"dis_{base}", t), g(f"soc_{base}", t)
         sell, buy = blk("sell", base, t), blk("buy", base, t)
         short = g(f"short_{base}", t)
-        price_impact = float(sc0.usep[t]) * imp_e * (sell - buy)
+        price_impact = float(sc0.usep[t]) * imp_e[t] * (sell - buy)
         r_tot = g("r1", t) + g("r2", t) + g("rb", t)
         g_tot = g("g1", t) + g("g2", t) + g("gb", t)
         avail_solar = min(max(sc0.solar_import[t], 0), inp.import_limit_mw * sc0.import_limit_factor) \
@@ -551,11 +556,12 @@ def _extract(inp, scens, x, idx, mode, method, lam,
     sell_mwh = sum(iv["energy_sell_mw"] for iv in intervals) * DT
     buy_mwh = sum(iv["energy_buy_mw"] for iv in intervals) * DT
     sell_rev = sum(iv["usep_effective"] * iv["energy_sell_mw"] for iv in intervals) * DT
+    imp_mean = lambda k: rnd(float(np.mean(np.asarray(mkt[k], dtype=float))))
     market_impact = {
         "enabled": mkt["enabled"],
-        "energy_impact_pct_per_100mw": rnd(mkt["energy_impact_pct_per_100mw"]),
-        "reserve_impact_pct_per_100mw": rnd(mkt["reserve_impact_pct_per_100mw"]),
-        "regulation_impact_pct_per_100mw": rnd(mkt["regulation_impact_pct_per_100mw"]),
+        "energy_impact_pct_per_100mw": imp_mean("energy_impact_pct_per_100mw"),
+        "reserve_impact_pct_per_100mw": imp_mean("reserve_impact_pct_per_100mw"),
+        "regulation_impact_pct_per_100mw": imp_mean("regulation_impact_pct_per_100mw"),
         "n_blocks": elast["K"],
         "energy_sold_mwh": rnd(sell_mwh), "energy_bought_mwh": rnd(buy_mwh),
         "avg_usep_forecast": rnd(float(np.mean(sc0.usep))),
