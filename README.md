@@ -6,6 +6,28 @@ risk metrics, and a market-elasticity model in which the genco's own offers
 move the clearing price — with the elasticity forecast reconstructed from
 the delayed offer stack via factor-graph fusion.
 
+## Quick start
+
+Install everything (Python deps, frontend deps, frontend build):
+
+```bash
+pip install -r backend/requirements.txt && npm --prefix frontend install && npm --prefix frontend run build
+```
+
+Run backend + frontend together on http://127.0.0.1:8000 (UI at `/`, API at `/api`, docs at `/docs`):
+
+```bash
+uvicorn --app-dir backend app.main:app --port 8000
+```
+
+Log in as any demo user (`trader1`, `admin`, ... — no password). For
+frontend hot reload during development, run Vite alongside instead of
+building:
+
+```bash
+uvicorn --app-dir backend app.main:app --port 8000 & npm --prefix frontend run dev
+```
+
 ## Layout
 
 ```
